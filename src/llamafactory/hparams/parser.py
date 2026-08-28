@@ -486,8 +486,8 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         if is_deepspeed_zero3_enabled():
             raise ValueError("`predict_with_generate` is incompatible with DeepSpeed ZeRO-3.")
 
-        if finetuning_args.compute_accuracy:
-            raise ValueError("Cannot use `predict_with_generate` and `compute_accuracy` together.")
+        if finetuning_args.compute_accuracy or finetuning_args.compute_semantic_similarity:
+            raise ValueError("Cannot use `predict_with_generate` and teacher-forced evaluation metrics together.")
 
     if training_args.do_train and model_args.quantization_device_map == "auto":
         raise ValueError("Cannot use device map for quantized models in training.")

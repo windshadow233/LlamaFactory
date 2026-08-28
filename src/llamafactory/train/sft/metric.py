@@ -60,14 +60,21 @@ def eval_logit_processor(logits: "torch.Tensor", labels: "torch.Tensor") -> "tor
 
 @dataclass
 class ComputeAccuracy:
-    r"""Compute accuracy and support `batch_eval_metrics`."""
+    r"""Compute token accuracy and optional embedding similarity."""
+
+    compute_accuracy: bool = True
+    embedding_weight: Optional["torch.Tensor"] = None
 
     def _dump(self) -> Optional[dict[str, float]]:
         result = None
         if hasattr(self, "score_dict"):
             result = {k: float(np.mean(v)) for k, v in self.score_dict.items()}
 
-        self.score_dict = {"accuracy": []}
+        self.score_dict = {}
+        if self.compute_accuracy:
+            self.score_dict["accuracy"] = []
+        if self.embedding_weight is not None:
+            self.score_dict["semantic_similarity"] = []
         return result
 
     def __post_init__(self):
@@ -78,7 +85,23 @@ class ComputeAccuracy:
         for i in range(len(preds)):
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
-            self.score_dict["accuracy"].append(np.mean(pred[label_mask] == label[label_mask]))
+            if not np.any(label_mask):
+                continue
+
+            if self.compute_accuracy:
+                self.score_dict["accuracy"].append(np.mean(pred[label_mask] == label[label_mask]))
+
+            if self.embedding_weight is not None:
+                with torch.no_grad():
+                    device = self.embedding_weight.device
+                    pred_ids = torch.as_tensor(pred[label_mask], dtype=torch.long, device=device)
+                    label_ids = torch.as_tensor(label[label_mask], dtype=torch.long, device=device)
+                    pred_embedding = self.embedding_weight.index_select(0, pred_ids).float().mean(dim=0)
+                    label_embedding = self.embedding_weight.index_select(0, label_ids).float().mean(dim=0)
+                    similarity = torch.nn.functional.cosine_similarity(
+                        pred_embedding.unsqueeze(0), label_embedding.unsqueeze(0)
+                    ).item()
+                self.score_dict["semantic_similarity"].append(similarity)
 
         if compute_result:
             return self._dump()

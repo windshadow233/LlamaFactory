@@ -75,6 +75,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
 
+        preview_limit = os.getenv("LLAMAFACTORY_PREDICTION_PREVIEW_LIMIT", "0")
+        try:
+            self._prediction_preview_limit = max(int(preview_limit), 0)
+        except ValueError:
+            logger.warning_rank0(
+                "Ignoring invalid LLAMAFACTORY_PREDICTION_PREVIEW_LIMIT=%r; expected a non-negative integer.",
+                preview_limit,
+            )
+            self._prediction_preview_limit = 0
+        self._prediction_preview_count = 0
+
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
 
@@ -185,6 +196,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if generated_tokens is not None and self.args.predict_with_generate:
             generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
             generated_tokens = generated_tokens.contiguous()
+
+            remaining = self._prediction_preview_limit - self._prediction_preview_count
+            if remaining > 0 and labels is not None and self.is_world_process_zero():
+                preview_preds = generated_tokens[:remaining].detach().cpu()
+                preview_labels = labels[:remaining].detach().cpu()
+                preview_labels = preview_labels.masked_fill(
+                    preview_labels.eq(IGNORE_INDEX), self.processing_class.pad_token_id
+                )
+                decoded_preds = self.processing_class.batch_decode(preview_preds, skip_special_tokens=True)
+                decoded_labels = self.processing_class.batch_decode(preview_labels, skip_special_tokens=True)
+                for prediction, label in zip(decoded_preds, decoded_labels):
+                    self._prediction_preview_count += 1
+                    logger.info_rank0(
+                        "Prediction preview %d/%d | prediction=%r | label=%r",
+                        self._prediction_preview_count,
+                        self._prediction_preview_limit,
+                        prediction.strip(),
+                        label.strip(),
+                    )
 
         return loss, generated_tokens, labels
 

@@ -55,7 +55,7 @@ class DatasetConverter:
             if isinstance(medias[0], str):
                 for i in range(len(medias)):
                     media_path = os.path.join(self.data_args.media_dir, medias[i])
-                    if os.path.isfile(media_path):
+                    if os.path.exists(media_path):
                         medias[i] = media_path
                     else:
                         logger.warning_rank0_once(
@@ -66,7 +66,7 @@ class DatasetConverter:
                 for i in range(len(medias)):
                     for j in range(len(medias[i])):
                         media_path = os.path.join(self.data_args.media_dir, medias[i][j])
-                        if os.path.isfile(media_path):
+                        if os.path.exists(media_path):
                             medias[i][j] = media_path
                         else:
                             logger.warning_rank0_once(

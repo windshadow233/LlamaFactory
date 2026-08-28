@@ -117,16 +117,26 @@ class SaveProcessorCallback(TrainerCallback):
     def __init__(self, processor: "ProcessorMixin") -> None:
         self.processor = processor
 
+    def _save_processor(self, output_dir: str) -> None:
+        save_pretrained = getattr(self.processor, "save_pretrained", None)
+        if save_pretrained is None:
+            logger.warning_rank0_once(
+                f"Processor {type(self.processor).__name__} does not implement `save_pretrained`; skipping it."
+            )
+            return
+
+        save_pretrained(output_dir)
+
     @override
     def on_save(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if args.should_save:
             output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-            self.processor.save_pretrained(output_dir)
+            self._save_processor(output_dir)
 
     @override
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         if args.should_save:
-            self.processor.save_pretrained(args.output_dir)
+            self._save_processor(args.output_dir)
 
 
 class PissaConvertCallback(TrainerCallback):

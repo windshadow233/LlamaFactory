@@ -15,13 +15,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import inspect
+import json
 import math
 import os
 import re
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, NotRequired, Optional, TypedDict, Union
 
@@ -2603,6 +2606,183 @@ class Qwen2VLPlugin(BasePlugin):
 
 
 @dataclass
+class MageVLPlugin(Qwen2VLPlugin):
+    r"""Codec-native Mage-VL plugin using assets precomputed by cv-preinfer.
+
+    ``videos`` may contain an asset directory directly, or an MP4 below a
+    ``clips/<split>/`` directory with its matching assets below
+    ``codec/<split>/<clip_stem>/``.  Codec videos are exposed to Mage-VL via
+    its image aliases (pixel_values/image_grid_thw) plus patch_positions.
+    """
+
+    codec_max_pixels: int = 150000
+
+    @staticmethod
+    def _resolve_codec_dir(video: "VideoInput") -> Path:
+        if not isinstance(video, (str, os.PathLike)):
+            raise TypeError(f"Mage-VL codec input must be a path, got {type(video)}.")
+
+        path = Path(video)
+        if path.is_dir() and (path / "meta.json").is_file():
+            return path
+
+        parts = list(path.parts)
+        try:
+            clips_idx = parts.index("clips")
+        except ValueError as exc:
+            raise FileNotFoundError(
+                f"Cannot infer codec assets for {path}; pass an asset directory or use a clips/<split>/ path."
+            ) from exc
+
+        parts[clips_idx] = "codec"
+        candidate = Path(*parts).with_suffix("")
+        if not (candidate / "meta.json").is_file():
+            raise FileNotFoundError(f"Mage-VL codec assets not found: {candidate}")
+
+        return candidate
+
+    @staticmethod
+    def _codec_module(processor: "MMProcessor"):
+        processor_module = processor.__class__.__module__
+        package = processor_module.rsplit(".", 1)[0] if "." in processor_module else ""
+        candidates = [f"{package}.codec_video_processing_mage_vl" if package else ""]
+        candidates.append("codec_video_processing_mage_vl")
+        for module_name in candidates:
+            if not module_name:
+                continue
+            try:
+                return importlib.import_module(module_name)
+            except ImportError:
+                continue
+
+        raise ImportError(
+            f"Cannot import codec_video_processing_mage_vl next to processor module {processor_module}."
+        )
+
+    def _load_codec_inputs(self, video: "VideoInput", processor: "MMProcessor") -> dict[str, Any]:
+        codec_dir = self._resolve_codec_dir(video)
+        with (codec_dir / "meta.json").open(encoding="utf-8") as f:
+            meta = json.load(f)
+
+        canvas_files = meta.get("canvas_files") or sorted(p.name for p in codec_dir.glob("canvas_*.jpg"))
+        images = [Image.open(codec_dir / name).convert("RGB") for name in canvas_files]
+        src_positions = np.load(codec_dir / "src_patch_position.npy", allow_pickle=False)
+        codec = self._codec_module(processor)
+        images, src_positions, _ = codec.drop_padding_canvases(images, src_positions)
+        if not images:
+            raise RuntimeError(f"Mage-VL codec assets contain no usable canvases: {codec_dir}")
+
+        image_data = codec.codec_image_processor_outputs(
+            processor.image_processor, images, max_pixels=self.codec_max_pixels
+        )
+        image_grid_thw = image_data["image_grid_thw"]
+        patch_positions = codec.codec_positions_for_processor(
+            src_positions, image_grid_thw, device=image_grid_thw.device
+        )
+        return {
+            "pixel_values": image_data["pixel_values"],
+            "image_grid_thw": image_grid_thw,
+            "patch_positions": patch_positions,
+            "fps": float(meta.get("fps") or 30.0),
+            "codec": codec,
+        }
+
+    def _load_codec_positions(self, video: "VideoInput", processor: "MMProcessor") -> dict[str, Any]:
+        r"""Load token positions without decoding canvas pixels during dataset tokenization."""
+        codec_dir = self._resolve_codec_dir(video)
+        with (codec_dir / "meta.json").open(encoding="utf-8") as f:
+            meta = json.load(f)
+
+        canvas_files = meta.get("canvas_files") or sorted(p.name for p in codec_dir.glob("canvas_*.jpg"))
+        src_positions = np.load(codec_dir / "src_patch_position.npy", allow_pickle=False)
+        if not canvas_files or src_positions.shape[0] % len(canvas_files) != 0:
+            raise ValueError(f"Invalid canvas/position layout in codec assets: {codec_dir}")
+
+        positions_per_canvas = src_positions.shape[0] // len(canvas_files)
+        position_chunks = src_positions.reshape(len(canvas_files), positions_per_canvas, 3)
+        keep_mask = (position_chunks[..., 0] >= 0).any(axis=1)
+        if bool((keep_mask & ~((position_chunks[..., 0] >= 0).all(axis=1))).any()):
+            raise ValueError(f"Encountered half-padding canvas in codec assets: {codec_dir}")
+
+        patch_size = int(processor.image_processor.patch_size)
+        grid_rows = []
+        for filename, keep in zip(canvas_files, keep_mask.tolist()):
+            if not keep:
+                continue
+            with Image.open(codec_dir / filename) as image:
+                width, height = image.size
+            if height % patch_size or width % patch_size:
+                raise ValueError(f"Canvas is not aligned to patch size {patch_size}: {codec_dir / filename}")
+            grid_rows.append((1, height // patch_size, width // patch_size))
+
+        kept_positions = position_chunks[keep_mask].reshape(-1, 3)
+        image_grid_thw = torch.tensor(grid_rows, dtype=torch.long)
+        codec = self._codec_module(processor)
+        patch_positions = codec.codec_positions_for_processor(
+            kept_positions, image_grid_thw, device=image_grid_thw.device
+        )
+        return {
+            "patch_positions": patch_positions,
+            "fps": float(meta.get("fps") or 30.0),
+            "codec": codec,
+        }
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> list[dict[str, str]]:
+        self._validate_input(processor, images, videos, audios)
+        self._validate_messages(messages, images, videos, audios)
+        if images or audios:
+            raise ValueError("Mage-VL codec SFT currently supports video-only multimodal samples.")
+
+        messages = deepcopy(messages)
+        video_idx = 0
+        for message in messages:
+            content = message["content"]
+            while VIDEO_PLACEHOLDER in content:
+                codec_inputs = self._load_codec_positions(videos[video_idx], processor)
+                placeholder = f"{self.vision_bos_token}{self.video_token}{self.vision_eos_token}"
+                replacement = codec_inputs["codec"].rewrite_text_with_codec_positions(
+                    placeholder,
+                    codec_inputs["patch_positions"],
+                    fps=codec_inputs["fps"],
+                    decimals=1,
+                )
+                content = content.replace(VIDEO_PLACEHOLDER, replacement.rstrip("\n"), 1)
+                video_idx += 1
+
+            message["content"] = content
+
+        return messages
+
+    @override
+    def _get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: "MMProcessor",
+    ) -> dict[str, "torch.Tensor"]:
+        if images or audios:
+            raise ValueError("Mage-VL codec SFT currently supports video-only multimodal samples.")
+        if not videos:
+            return {}
+
+        items = [self._load_codec_inputs(video, processor) for video in videos]
+        return {
+            "pixel_values": torch.cat([item["pixel_values"] for item in items], dim=0),
+            "image_grid_thw": torch.cat([item["image_grid_thw"] for item in items], dim=0),
+            "patch_positions": torch.cat([item["patch_positions"] for item in items], dim=0),
+        }
+
+
+@dataclass
 class Qwen3VLPlugin(Qwen2VLPlugin):
     @override
     def _get_qwen_video_resize(
@@ -3265,6 +3445,7 @@ PLUGINS = {
     "qwen2_audio": Qwen2AudioPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,
+    "mage_vl": MageVLPlugin,
     "qwen3_vl": Qwen3VLPlugin,
     "video_llava": VideoLlavaPlugin,
     "youtu_vl": YoutuVLPlugin,

@@ -161,8 +161,13 @@ def run_sft(
     metric_module = {}
     if training_args.predict_with_generate:
         metric_module["compute_metrics"] = ComputeSimilarity(tokenizer=tokenizer)
-    elif finetuning_args.compute_accuracy:
-        metric_module["compute_metrics"] = ComputeAccuracy()
+    elif finetuning_args.compute_accuracy or finetuning_args.compute_semantic_similarity:
+        metric_module["compute_metrics"] = ComputeAccuracy(
+            compute_accuracy=finetuning_args.compute_accuracy,
+            embedding_weight=(
+                model.get_input_embeddings().weight if finetuning_args.compute_semantic_similarity else None
+            ),
+        )
         metric_module["preprocess_logits_for_metrics"] = eval_logit_processor
 
     # Keyword arguments for `model.generate`

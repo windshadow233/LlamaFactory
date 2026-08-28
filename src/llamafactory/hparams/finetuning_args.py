@@ -559,6 +559,12 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute the token-level accuracy at evaluation."},
     )
+    compute_semantic_similarity: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether or not to compute caption-level cosine similarity using the model token embeddings."
+        },
+    )
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},

@@ -405,6 +405,19 @@ _register_composite_model(
     lora_conflict_keys=["patch_embed"],
 )
 
+_register_composite_model(
+    model_type="mage_vl",
+    projector_keys=["visual.merger"],
+    vision_model_keys=[
+        "visual.embeddings",
+        "visual.layernorm_pre",
+        "visual.encoder",
+        "visual.video_rope",
+    ],
+    language_model_keys=["language_model", "lm_head"],
+    lora_conflict_keys=["merger"],
+)
+
 
 _register_composite_model(
     model_type="qwen3_vl_moe",
